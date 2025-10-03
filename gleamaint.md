@@ -146,6 +146,7 @@ from typeguard import typechecked
 | Exhaustive cases      | Missing case handling        | Enum classes + complete match coverage    | ✅ Enforced    |
 | Pipe operator         | No native pipes              | `sspipe` Gleam-like pipe operator         | ✅ Solved      |
 | Pipe with `use`       | No native pipes, nor use     | `returns.pipeline.flow` Pipe with results | 🟠 Much Better |
+| `use` expressions     | No native use syntax         | `case Ok(x): pass` pattern with match     | ✅ Solved      |
 | result.try            | No native pipes              | `returns.pointfree.bind` Gleam-like try   | ✅ Solved      |
 | result.map            | No native pipes              | `returns.pointfree.map` Gleam-like map    | ✅ Solved      |
 | Pure functions        | Side effects common          | Enforce purity rules                      | ✅ Enforced    |
@@ -171,6 +172,31 @@ compatibility and predictability.
 While `@dataclass(frozen=True)` prevents direct field assignment, it does NOT provide
 true immutability for nested structures; prefer `pyrsistent` collections and records for
 enforced immutability.
+
+### Gleam `use` Expression Pattern
+
+Gleam's `use` expression provides flat async composition. In Python, we achieve this
+with pattern matching:
+
+```python
+# Gleam: use ctx <- some_call(ctx)
+# Python equivalent:
+match await some_call(ctx):
+    case Err(e):
+        return Err(e)
+    case Ok(ctx):  # Variable rebinding
+        pass
+
+# ctx now contains unwrapped value
+```
+
+This pattern:
+
+- Works with async/await
+- Allows logging between steps
+- Enables conditional routing
+- Maintains flat structure (no callback hell)
+- Translates mechanically to Gleam
 
 ## Rules
 
@@ -206,6 +232,14 @@ enforced immutability.
   and handlers; skip hot inner loops if profiling shows overhead.
 - Prefer concrete immutable types (pmap, pvector, PRecord) and explicit Result[...]
   annotations so runtime checks validate container and value shapes consistently.
+- Use `case Ok(x): pass` pattern for Gleam-style `use` expressions in async workflows
+- Add comments `# use x <- function(x)` above match statements to document Gleam
+  equivalence
+- Keep match statements flat by using sequential `case Ok(x): pass` blocks instead of
+  nesting
+- Leverage variable rebinding in `case Ok(x):` to unwrap Results without manual
+  `.unwrap()`
+- Use pattern matching for all Result handling, never `isinstance()` checks
 
 ### Don't
 
@@ -227,6 +261,11 @@ enforced immutability.
 - Don't use complex actor frameworks or threading primitives
 - Don't share mutable state between background tasks
 - Don't create background tasks with side effects - return Results instead
+- Don't nest multiple levels of `match` statements - use sequential `case Ok(x): pass`
+  instead
+- Don't manually unwrap Results with `.unwrap()` - let pattern matching rebind variables
+- Don't use `if isinstance(result, Ok)` - use `match result: case Ok(x):` instead
+- Don't try to use `Result.do` for async workflows - it only works for sync code
 
 ## Reasonings
 
@@ -270,6 +309,15 @@ enforced immutability.
   shared memory ensures clean translation to BEAM VM's isolated process model
 - **Avoiding exceptions, inheritance, and global mutation** simplifies both migration to
   Gleam and ongoing maintenance by eliminating implicit control flow and shared state
+- The `case Ok(x): pass` pattern with variable rebinding provides a mechanical
+  translation of Gleam's `use` expressions for Python async workflows. Unlike
+  `Result.do` which only works for synchronous code, this pattern supports await,
+  logging between steps, and conditional branching. The pattern leverages Python's match
+  statement to rebind variables automatically - when you write `case Ok(ctx):`, the
+  outer `ctx` variable is shadowed with the unwrapped value, creating flat sequential
+  composition without nested callbacks. This directly maps to how Gleam's
+  `use ctx <- call()` unwraps and rebinds variables, making Python-to-Gleam migration
+  straightforward and predictable.
 
 ## Format
 
@@ -2458,6 +2506,124 @@ class EventBus:
     def by_type(self, t: str) -> "pvector[Event]":
         return pvector([e for e in self._events if e.type == t])
 ```
+
+### Gleam `use` Pattern with `case Ok(x): pass`
+
+#### Async Workflow with Flat Composition
+
+```python
+from returns.result import Result, Success as Ok, Failure as Err
+from pyrsistent import PRecord, field
+import asyncio
+import logging
+
+class Context(PRecord):
+    request_id: str = field(type=str, mandatory=True)
+    step: int = field(type=int, mandatory=True)
+    intent: str = field(type=str, mandatory=True)
+
+async def triage_call(ctx: Context) -> Result[Context, str]:
+    """Simulate async triage operation."""
+    await asyncio.sleep(0.01)
+    return Ok(ctx.set(step=ctx.step + 1, intent="RETRIEVAL"))
+
+async def retrieval_call(ctx: Context) -> Result[Context, str]:
+    """Simulate async retrieval operation."""
+    await asyncio.sleep(0.01)
+    return Ok(ctx.set(step=ctx.step + 1))
+
+async def inferrer_call(ctx: Context) -> Result[Context, str]:
+    """Simulate async inference operation."""
+    await asyncio.sleep(0.01)
+    return Ok(ctx.set(step=ctx.step + 1))
+
+async def enforcer_call(ctx: Context) -> Result[Context, str]:
+    """Fallback enforcer."""
+    return Ok(ctx.set(step=999, intent="ENFORCED"))
+
+
+async def workflow(ctx: Context) -> Result[Context, str]:
+    """
+    Flat async workflow using Gleam-style use pattern.
+
+    Demonstrates:
+    - Async/await support
+    - Logging between steps
+    - Conditional routing
+    - Flat structure (no nesting)
+    - Variable rebinding with case Ok(x): pass
+    """
+
+    # use ctx <- triage_call(ctx)
+    match await triage_call(ctx):
+        case Err(e):
+            logging.error(f"✗ Triage failed: {e}")
+            return await enforcer_call(ctx)
+        case Ok(ctx):  # ctx is rebound to unwrapped value
+            pass
+
+    logging.info(f"✓ Triage completed: step={ctx.step}, intent={ctx.intent}")
+
+    # Conditional routing based on intent
+    match ctx.intent:
+        case "RETRIEVAL":
+            logging.info("🎯 Taking retrieval → inferrer path")
+
+            # use ctx <- retrieval_call(ctx)
+            match await retrieval_call(ctx):
+                case Err(e):
+                    logging.error(f"✗ Retrieval failed: {e}")
+                    return Err(e)
+                case Ok(ctx):  # ctx rebound again
+                    pass
+
+            logging.info(f"✓ Retrieval completed: step={ctx.step}")
+
+            # use ctx <- inferrer_call(ctx)
+            match await inferrer_call(ctx):
+                case Err(e):
+                    logging.error(f"✗ Inferrer failed: {e}")
+                    return Err(e)
+                case Ok(ctx):  # ctx rebound one more time
+                    pass
+
+            logging.info(f"✓ Inferrer completed: step={ctx.step}")
+            return Ok(ctx)
+
+        case "ADVICE":
+            logging.info("🎯 Taking advice path")
+            return await retrieval_call(ctx)
+
+        case _:
+            logging.warning(f"⚠️ Unknown intent: {ctx.intent}")
+            return await enforcer_call(ctx)
+```
+
+#### Gleam Translation
+
+The Python pattern translates directly to Gleam:
+
+**Python:**
+
+```python
+# use ctx <- retrieval_call(ctx)
+match await retrieval_call(ctx):
+    case Err(e):
+        return Err(e)
+    case Ok(ctx):
+        pass
+
+logging.info(f"Retrieved: {ctx.step}")
+```
+
+**Gleam:**
+
+```gleam
+use ctx <- retrieval_call(ctx)
+io.println("Retrieved: " <> int.to_string(ctx.step))
+```
+
+Both achieve flat composition with early error returns and variable rebinding.
 
 # ⚠️ CRITICAL: ACTUAL CODE ANALYSIS ONLY ⚠️
 
